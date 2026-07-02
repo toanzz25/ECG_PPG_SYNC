@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "main/PPG_PCG_ECG.c"
+        "Sensor_init/sensor_init.c"
+    INCLUDE_DIRS
+        "main"
+        "Sensor_init"
+    REQUIRES
+        max30105
+        driver
+        esp_driver_gpio
+        esp_driver_ledc
+        esp_timer
+        esp_adc
+)
