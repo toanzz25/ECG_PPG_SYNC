@@ -30,6 +30,19 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 
+BG = "#0f172a"
+PANEL = "#111827"
+PANEL_ALT = "#172033"
+SURFACE = "#1f2937"
+BORDER = "#334155"
+TEXT = "#e5e7eb"
+MUTED = "#94a3b8"
+ACCENT = "#38bdf8"
+ACCENT_DARK = "#0f766e"
+DANGER = "#ef4444"
+PLOT_BG = "#0b1120"
+GRID = "#334155"
+
 BAUD_RATE = 115200
 WAVELET_NAME = "db4"
 WAVELET_LEVEL = 3
@@ -40,6 +53,11 @@ ECG_MAINS_HZ = 50.0
 ECG_MAINS_NOTCH_WIDTH_HZ = 2.0
 ECG_CLIP_LOW_THRESHOLD = 20.0
 ECG_CLIP_HIGH_THRESHOLD = 4075.0
+PPG_FALLBACK_SAMPLE_RATE_HZ = 25.0
+PPG_HIGHPASS_HZ = 0.5
+PPG_LOWPASS_HZ = 8.0
+PPG_TREND_WINDOW_S = 1.2
+MAX30102_ADC_MAX = 262143.0
 BASE_DIR = Path("data_csv") / "SYNC"
 RAW_DIR = BASE_DIR / "raw"
 FILTERED_DIR = BASE_DIR / "filtered"
@@ -98,9 +116,77 @@ def ecg_denoise(values: np.ndarray) -> np.ndarray:
     return filtered - np.nanmedian(filtered)
 
 
+def estimate_sample_rate_hz(time_ms: np.ndarray, fallback_hz: float = PPG_FALLBACK_SAMPLE_RATE_HZ) -> float:
+    time_ms = np.asarray(time_ms, dtype=float)
+    if len(time_ms) < 2:
+        return fallback_hz
+
+    dt_ms = np.diff(time_ms)
+    dt_ms = dt_ms[np.isfinite(dt_ms) & (dt_ms > 0)]
+    if len(dt_ms) == 0:
+        return fallback_hz
+
+    return 1000.0 / float(np.nanmedian(dt_ms))
+
+
+def centered_moving_average(values: np.ndarray, window_samples: int) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if len(values) < 3:
+        return np.full(len(values), np.nanmedian(values))
+
+    window_samples = max(3, int(window_samples))
+    if window_samples % 2 == 0:
+        window_samples += 1
+    if window_samples > len(values):
+        window_samples = len(values) if len(values) % 2 == 1 else len(values) - 1
+    if window_samples < 3:
+        return np.full(len(values), np.nanmedian(values))
+
+    pad = window_samples // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    kernel = np.ones(window_samples, dtype=float) / float(window_samples)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def ppg_ac_component(values: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    sample_rate_hz = estimate_sample_rate_hz(time_ms)
+    window_samples = int(round(PPG_TREND_WINDOW_S * sample_rate_hz))
+    trend = centered_moving_average(values, window_samples)
+    return values - trend
+
+
+def fft_ppg_band_clean(values: np.ndarray, sample_rate_hz: float) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if len(values) < 8 or sample_rate_hz <= 0:
+        return values - np.nanmedian(values)
+
+    centered = values - np.nanmedian(values)
+    spectrum = np.fft.rfft(centered)
+    freqs = np.fft.rfftfreq(len(centered), d=1.0 / sample_rate_hz)
+    lowpass_hz = min(PPG_LOWPASS_HZ, sample_rate_hz * 0.45)
+
+    keep = (freqs >= PPG_HIGHPASS_HZ) & (freqs <= lowpass_hz)
+    spectrum[~keep] = 0
+
+    return np.fft.irfft(spectrum, n=len(centered))
+
+
+def ppg_denoise(values: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
+    sample_rate_hz = estimate_sample_rate_hz(time_ms)
+    ac = ppg_ac_component(values, time_ms)
+    cleaned = fft_ppg_band_clean(ac, sample_rate_hz)
+    filtered = wavelet_denoise(cleaned, wavelet_name=WAVELET_NAME, level=WAVELET_LEVEL)
+    if np.all(np.isnan(filtered)):
+        filtered = cleaned
+    return filtered - np.nanmedian(filtered)
+
+
 def summarize_signal_quality(rows: list["SyncRow"], duration_s: int) -> str:
     ecg = np.array([row.ecg_raw for row in rows if np.isfinite(row.ecg_raw)], dtype=float)
-    ppg = np.array([row.ppg_ir_raw for row in rows if np.isfinite(row.ppg_ir_raw)], dtype=float)
+    ppg_rows = [row for row in rows if np.isfinite(row.ppg_ir_raw)]
+    ppg = np.array([row.ppg_ir_raw for row in ppg_rows], dtype=float)
+    ppg_time = np.array([row.time_ms for row in ppg_rows], dtype=float)
     notes: list[str] = []
 
     if len(ecg):
@@ -111,8 +197,15 @@ def summarize_signal_quality(rows: list["SyncRow"], duration_s: int) -> str:
         notes.append(f"ECG n={len(ecg)}")
 
     if len(ppg):
-        rate = len(ppg) / max(duration_s, 1)
-        notes.append(f"PPG n={len(ppg)} (~{rate:.1f}Hz)")
+        rate = estimate_sample_rate_hz(ppg_time)
+        ir_dc = float(np.nanmean(ppg))
+        ir_ac = ppg_ac_component(ppg, ppg_time)
+        ir_ac_rms = float(np.sqrt(np.nanmean(np.square(ir_ac)))) if len(ir_ac) else 0.0
+        ir_acdc_percent = 100.0 * ir_ac_rms / max(abs(ir_dc), 1.0)
+        saturated = int(np.count_nonzero(ppg >= MAX30102_ADC_MAX * 0.95))
+        notes.append(f"PPG n={len(ppg)} Fs={rate:.1f}Hz IR_AC/DC={ir_acdc_percent:.2f}%")
+        if saturated:
+            notes.append(f"PPG saturated={saturated}")
 
     return " | ".join(notes)
 
@@ -194,8 +287,9 @@ class SyncUARTMonitor:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("ECG + PPG Sync UART Logger")
-        self.root.geometry("1180x760")
-        self.root.minsize(960, 640)
+        self.root.geometry("1240x780")
+        self.root.minsize(1040, 660)
+        self.root.configure(bg=BG)
 
         self.serial_obj = None
         self.worker = None
@@ -209,55 +303,181 @@ class SyncUARTMonitor:
         self.mode_var = tk.StringVar(value="BOTH")
         self.status_var = tk.StringVar(value="Ready")
 
+        self.configure_styles()
         self.build_ui()
         self.refresh_ports()
 
+    def configure_styles(self):
+        self.style = ttk.Style(self.root)
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.style.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        self.style.configure("App.TFrame", background=BG)
+        self.style.configure("Panel.TFrame", background=PANEL, relief="flat")
+        self.style.configure("Topbar.TFrame", background=PANEL)
+        self.style.configure("TLabel", background=BG, foreground=TEXT)
+        self.style.configure("Muted.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
+        self.style.configure("Title.TLabel", background=PANEL, foreground=TEXT, font=("Segoe UI Semibold", 15))
+        self.style.configure("Status.TLabel", background=PANEL_ALT, foreground=TEXT, padding=(14, 8), font=("Segoe UI", 9))
+        self.style.configure("Field.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
+        self.style.configure("Section.TLabel", background=PANEL, foreground=TEXT, font=("Segoe UI Semibold", 10))
+
+        self.style.configure(
+            "TButton",
+            background=SURFACE,
+            foreground=TEXT,
+            bordercolor=BORDER,
+            focusthickness=0,
+            padding=(12, 7),
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", "#27364a"), ("pressed", "#0f172a"), ("disabled", "#1e293b")],
+            foreground=[("disabled", "#64748b")],
+        )
+        self.style.configure("Accent.TButton", background=ACCENT_DARK, foreground="#ecfeff", bordercolor=ACCENT_DARK)
+        self.style.map("Accent.TButton", background=[("active", "#0d9488"), ("pressed", "#115e59")])
+        self.style.configure("Danger.TButton", background="#7f1d1d", foreground="#fee2e2", bordercolor="#991b1b")
+        self.style.map("Danger.TButton", background=[("active", "#991b1b"), ("pressed", "#450a0a")])
+
+        for widget in ("TEntry", "TCombobox"):
+            self.style.configure(
+                widget,
+                fieldbackground="#0b1220",
+                background="#0b1220",
+                foreground=TEXT,
+                bordercolor=BORDER,
+                lightcolor=BORDER,
+                darkcolor=BORDER,
+                insertcolor=TEXT,
+                arrowsize=14,
+                padding=5,
+            )
+            self.style.map(
+                widget,
+                fieldbackground=[("readonly", "#0b1220"), ("disabled", "#111827")],
+                foreground=[("readonly", TEXT), ("disabled", "#64748b")],
+                bordercolor=[("focus", ACCENT), ("active", ACCENT)],
+            )
+
+        self.root.option_add("*TCombobox*Listbox.background", "#0b1220")
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT_DARK)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ecfeff")
+
+        self.style.configure(
+            "TProgressbar",
+            troughcolor="#0b1220",
+            background=ACCENT,
+            bordercolor=BORDER,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
+            thickness=10,
+        )
+        self.style.configure("TPanedwindow", background=BG)
+        self.style.configure("Sash", background=BORDER)
+
     def build_ui(self):
-        top = ttk.Frame(self.root, padding=10)
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=14)
+        shell.pack(fill="both", expand=True)
+
+        top = ttk.Frame(shell, style="Topbar.TFrame", padding=(12, 10))
         top.pack(fill="x")
+        top.columnconfigure(1, weight=1)
 
-        ttk.Label(top, text="COM").grid(row=0, column=0, sticky="w")
-        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=18, state="readonly")
-        self.port_combo.grid(row=0, column=1, padx=6, sticky="w")
-        ttk.Button(top, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=4)
+        title_group = ttk.Frame(top, style="Topbar.TFrame")
+        title_group.grid(row=0, column=0, sticky="w")
+        ttk.Label(title_group, text="ECG + PPG Sync Monitor", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title_group, text="UART logger, CSV capture, FFT + wavelet preview", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
 
-        ttk.Label(top, text="Nguoi do").grid(row=0, column=3, sticky="w", padx=(18, 0))
-        ttk.Entry(top, textvariable=self.person_var, width=18).grid(row=0, column=4, padx=6)
+        actions = ttk.Frame(top, style="Topbar.TFrame")
+        actions.grid(row=0, column=2, sticky="e")
+        ttk.Button(actions, text="Start", style="Accent.TButton", command=self.start_measurement).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Stop", style="Danger.TButton", command=self.stop_measurement).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Open CSV", command=self.open_csv_file).pack(side="left")
 
-        ttk.Label(top, text="Mode").grid(row=0, column=5, sticky="w", padx=(18, 0))
-        ttk.Combobox(top, textvariable=self.mode_var, values=["BOTH", "ECG", "PPG"], width=8, state="readonly").grid(row=0, column=6, padx=6)
+        controls = ttk.Frame(shell, style="Panel.TFrame", padding=(12, 8))
+        controls.pack(fill="x", pady=(8, 6))
+        controls.columnconfigure(9, weight=1)
 
-        ttk.Label(top, text="Giay").grid(row=0, column=7, sticky="w", padx=(18, 0))
-        ttk.Entry(top, textvariable=self.duration_var, width=8).grid(row=0, column=8, padx=6)
+        ttk.Label(controls, text="COM PORT", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        self.port_combo = ttk.Combobox(controls, textvariable=self.port_var, width=18, state="readonly")
+        self.port_combo.grid(row=1, column=0, padx=(0, 8), pady=(4, 0), sticky="ew")
+        ttk.Button(controls, text="Refresh", command=self.refresh_ports).grid(row=1, column=1, padx=(0, 18), pady=(4, 0), sticky="w")
 
-        ttk.Button(top, text="Start", command=self.start_measurement).grid(row=0, column=9, padx=(18, 4))
-        ttk.Button(top, text="Stop", command=self.stop_measurement).grid(row=0, column=10, padx=4)
-        ttk.Button(top, text="Open CSV", command=self.open_csv_file).grid(row=0, column=11, padx=4)
+        ttk.Label(controls, text="NGUOI DO", style="Field.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(controls, textvariable=self.person_var, width=18).grid(row=1, column=2, padx=(0, 18), pady=(4, 0), sticky="ew")
 
-        self.progress = ttk.Progressbar(top, mode="determinate", length=180)
-        self.progress.grid(row=0, column=12, padx=(18, 0), sticky="ew")
-        top.columnconfigure(12, weight=1)
+        ttk.Label(controls, text="MODE", style="Field.TLabel").grid(row=0, column=3, sticky="w")
+        ttk.Combobox(controls, textvariable=self.mode_var, values=["BOTH", "ECG", "PPG"], width=9, state="readonly").grid(row=1, column=3, padx=(0, 18), pady=(4, 0), sticky="ew")
 
-        ttk.Label(self.root, textvariable=self.status_var, padding=(10, 0)).pack(fill="x")
+        ttk.Label(controls, text="THOI GIAN (S)", style="Field.TLabel").grid(row=0, column=4, sticky="w")
+        ttk.Entry(controls, textvariable=self.duration_var, width=10).grid(row=1, column=4, padx=(0, 18), pady=(4, 0), sticky="ew")
 
-        body = ttk.PanedWindow(self.root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=10, pady=10)
+        ttk.Label(controls, text="TIEN TRINH", style="Field.TLabel").grid(row=0, column=5, sticky="w")
+        self.progress = ttk.Progressbar(controls, mode="determinate", length=220)
+        self.progress.grid(row=1, column=5, columnspan=5, pady=(4, 0), sticky="ew")
 
-        plot_frame = ttk.Frame(body)
-        body.add(plot_frame, weight=4)
+        ttk.Label(shell, textvariable=self.status_var, style="Status.TLabel").pack(fill="x", pady=(0, 8))
 
-        self.figure = Figure(figsize=(8, 5), dpi=100)
+        body = ttk.PanedWindow(shell, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        plot_frame = ttk.Frame(body, style="Panel.TFrame", padding=8)
+        body.add(plot_frame, weight=6)
+
+        self.figure = Figure(figsize=(8.4, 5.2), dpi=100, facecolor=PLOT_BG)
         self.ax_ecg = self.figure.add_subplot(211)
         self.ax_ppg = self.figure.add_subplot(212, sharex=self.ax_ecg)
+        self.style_axes()
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        NavigationToolbar2Tk(self.canvas, plot_frame)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.configure(bg=PLOT_BG, highlightthickness=0)
+        canvas_widget.pack(fill="both", expand=True)
+        toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
+        toolbar.configure(bg=PANEL)
+        for child in toolbar.winfo_children():
+            try:
+                child.configure(bg=PANEL)
+            except tk.TclError:
+                pass
 
-        log_frame = ttk.Frame(body)
+        log_frame = ttk.Frame(body, style="Panel.TFrame", padding=8, width=260)
         body.add(log_frame, weight=1)
-        ttk.Label(log_frame, text="UART log").pack(anchor="w")
-        self.log_text = tk.Text(log_frame, height=10, wrap="none")
+        ttk.Label(log_frame, text="UART log", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        self.log_text = tk.Text(
+            log_frame,
+            height=10,
+            wrap="none",
+            bg="#070d1a",
+            fg="#cbd5e1",
+            insertbackground=TEXT,
+            selectbackground=ACCENT_DARK,
+            selectforeground="#ecfeff",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            padx=10,
+            pady=10,
+            font=("Consolas", 9),
+        )
         self.log_text.pack(fill="both", expand=True)
+
+    def style_axes(self):
+        for ax in (self.ax_ecg, self.ax_ppg):
+            ax.set_facecolor(PLOT_BG)
+            ax.tick_params(colors=MUTED, labelsize=9)
+            ax.xaxis.label.set_color(TEXT)
+            ax.yaxis.label.set_color(TEXT)
+            ax.title.set_color(TEXT)
+            for spine in ax.spines.values():
+                spine.set_color(BORDER)
+            ax.grid(True, color=GRID, alpha=0.28, linewidth=0.7)
 
     def refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -440,7 +660,7 @@ class SyncUARTMonitor:
             writer.writerow([
                 "person_name", "time_ms",
                 "ecg_raw", f"ecg_centered_bandpass_wavelet_{WAVELET_NAME}_level{WAVELET_LEVEL}",
-                "ppg_ir_raw", f"ppg_ir_wavelet_{WAVELET_NAME}_level{WAVELET_LEVEL}",
+                "ppg_ir_raw", f"ppg_ir_ac_bandpass_wavelet_{WAVELET_NAME}_level{WAVELET_LEVEL}",
                 "ppg_red_raw",
             ])
             for i, row in enumerate(rows):
@@ -468,7 +688,8 @@ class SyncUARTMonitor:
         ppg_idx = np.array([i for i, row in enumerate(rows) if not np.isnan(row.ppg_ir_raw)], dtype=int)
         if len(ppg_idx):
             ppg_values = np.array([rows[i].ppg_ir_raw for i in ppg_idx], dtype=float)
-            ppg_filtered[ppg_idx] = wavelet_denoise(ppg_values)
+            ppg_time_ms = np.array([rows[i].time_ms for i in ppg_idx], dtype=float)
+            ppg_filtered[ppg_idx] = ppg_denoise(ppg_values, ppg_time_ms)
 
         return ecg_filtered, ppg_filtered
 
@@ -488,24 +709,28 @@ class SyncUARTMonitor:
 
         self.ax_ecg.clear()
         self.ax_ppg.clear()
+        self.style_axes()
 
         if ecg_mask.any():
-            self.ax_ecg.plot(t[ecg_mask], ecg[ecg_mask], color="#999999", linewidth=0.8, alpha=0.65, label="ECG raw")
-            self.ax_ecg.plot(t[ecg_mask], ecg_filtered[ecg_mask], color="#d62728", linewidth=1.1, label="ECG filtered")
+            self.ax_ecg.plot(t[ecg_mask], ecg[ecg_mask], color="#8aa0b8", linewidth=0.85, alpha=0.72, label="ECG RAW")
+            self.ax_ecg.plot(t[ecg_mask], ecg_filtered[ecg_mask], color="#fb7185", linewidth=1.2, label="ECG wavelet")
+        self.ax_ecg.set_title("ECG", loc="left", color=TEXT, fontsize=11, fontweight="semibold", pad=6)
         self.ax_ecg.set_ylabel("ECG centered")
-        self.ax_ecg.grid(False)
-        self.ax_ecg.legend(loc="upper right")
+        self.ax_ecg.legend(loc="upper right", facecolor=PANEL, edgecolor=BORDER, labelcolor=TEXT)
 
         ppg_mask = np.isfinite(ppg)
         if ppg_mask.any():
-            self.ax_ppg.plot(t[ppg_mask], ppg[ppg_mask], color="#999999", linewidth=0.8, alpha=0.65, label="PPG IR raw")
-            self.ax_ppg.plot(t[ppg_mask], ppg_filtered[ppg_mask], color="#2ca02c", linewidth=1.1, label="PPG IR wavelet")
+            ppg_time_ms = np.array([row.time_ms for row in rows], dtype=float)
+            ppg_ac = np.full(len(rows), np.nan)
+            ppg_ac[ppg_mask] = ppg_ac_component(ppg[ppg_mask], ppg_time_ms[ppg_mask])
+            self.ax_ppg.plot(t[ppg_mask], ppg_ac[ppg_mask], color="#8aa0b8", linewidth=0.85, alpha=0.72, label="PPG IR AC")
+            self.ax_ppg.plot(t[ppg_mask], ppg_filtered[ppg_mask], color="#34d399", linewidth=1.2, label="PPG bandpass + wavelet")
+        self.ax_ppg.set_title("PPG", loc="left", color=TEXT, fontsize=11, fontweight="semibold", pad=6)
         self.ax_ppg.set_xlabel("Time (s)")
-        self.ax_ppg.set_ylabel("PPG IR raw")
-        self.ax_ppg.grid(True, alpha=0.25)
-        self.ax_ppg.legend(loc="upper right")
+        self.ax_ppg.set_ylabel("PPG IR AC")
+        self.ax_ppg.legend(loc="upper right", facecolor=PANEL, edgecolor=BORDER, labelcolor=TEXT)
 
-        self.figure.suptitle(title)
+        self.figure.suptitle(title, color=TEXT, fontsize=11)
         self.figure.tight_layout()
         self.canvas.draw_idle()
 
