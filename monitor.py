@@ -58,6 +58,8 @@ PPG_HIGHPASS_HZ = 0.5
 PPG_LOWPASS_HZ = 8.0
 PPG_TREND_WINDOW_S = 1.2
 MAX30102_ADC_MAX = 262143.0
+PTT_MIN_MS = 80.0
+PTT_MAX_MS = 600.0
 BASE_DIR = Path("data_csv") / "SYNC"
 RAW_DIR = BASE_DIR / "raw"
 FILTERED_DIR = BASE_DIR / "filtered"
@@ -218,6 +220,20 @@ class SyncRow:
     ppg_ir_raw: float
 
 
+@dataclass
+class DerivedMetrics:
+    instant_bpm: float = np.nan
+    sdnn_ms: float = np.nan
+    rmssd_ms: float = np.nan
+    ptt_ms: float = np.nan
+    spo2_percent: float = np.nan
+    perfusion_index_percent: float = np.nan
+    ecg_peak_count: int = 0
+    ppg_peak_count: int = 0
+    ptt_pair_count: int = 0
+    pulse_source: str = "--"
+
+
 def parse_float_or_nan(text: str) -> float:
     text = text.strip()
     if not text:
@@ -269,11 +285,13 @@ def load_sync_rows_from_file(path: Path) -> list[SyncRow]:
             if saw_uart_marker and not in_uart_block:
                 continue
 
-            # Saved raw CSV has person_name,time_ms,...; UART capture has time_ms,...
+            # Saved raw CSV has 5 columns; filtered CSV has raw RED/IR in a different order.
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 5 and parts[1].lower() == "time_ms":
                 continue
-            if len(parts) >= 5:
+            if len(parts) >= 7:
+                line = ",".join([parts[1], parts[2], parts[6], parts[4]])
+            elif len(parts) >= 5:
                 line = ",".join(parts[1:5])
 
             row = parse_sync_csv_line(line)
@@ -281,6 +299,185 @@ def load_sync_rows_from_file(path: Path) -> list[SyncRow]:
                 rows.append(row)
 
     return normalize_sync_rows(rows)
+
+
+def finite_std(values: np.ndarray, ddof: int = 0) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) <= ddof:
+        return np.nan
+    return float(np.std(values, ddof=ddof))
+
+
+def rms(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(np.square(values))))
+
+
+def robust_mad(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return 1.4826 * mad
+
+
+def compact_peak_candidates(candidate_idx: np.ndarray, score: np.ndarray, min_distance_samples: int) -> np.ndarray:
+    if len(candidate_idx) == 0:
+        return np.array([], dtype=int)
+
+    min_distance_samples = max(1, int(min_distance_samples))
+    selected: list[int] = []
+    for idx in sorted(candidate_idx, key=lambda i: score[i], reverse=True):
+        if all(abs(idx - chosen) >= min_distance_samples for chosen in selected):
+            selected.append(int(idx))
+    return np.array(sorted(selected), dtype=int)
+
+
+def detect_peaks(
+    time_ms: np.ndarray,
+    values: np.ndarray,
+    *,
+    min_distance_s: float,
+    threshold_scale: float,
+    use_abs: bool = False,
+) -> np.ndarray:
+    time_ms = np.asarray(time_ms, dtype=float)
+    values = np.asarray(values, dtype=float)
+    mask = np.isfinite(time_ms) & np.isfinite(values)
+    time_ms = time_ms[mask]
+    values = values[mask]
+    if len(values) < 5:
+        return np.array([], dtype=float)
+
+    signal = np.abs(values) if use_abs else values.copy()
+    signal = signal - np.nanmedian(signal)
+    scale = robust_mad(signal)
+    if not np.isfinite(scale) or scale <= 1e-9:
+        scale = finite_std(signal)
+    if not np.isfinite(scale) or scale <= 1e-9:
+        return np.array([], dtype=float)
+
+    threshold = max(float(np.nanmedian(signal) + threshold_scale * scale), float(np.nanpercentile(signal, 70)))
+    candidate_mask = (signal[1:-1] >= signal[:-2]) & (signal[1:-1] > signal[2:]) & (signal[1:-1] > threshold)
+    candidate_idx = np.flatnonzero(candidate_mask) + 1
+    if len(candidate_idx) == 0:
+        return np.array([], dtype=float)
+
+    sample_rate_hz = estimate_sample_rate_hz(time_ms)
+    min_distance_samples = int(round(min_distance_s * sample_rate_hz))
+    peak_idx = compact_peak_candidates(candidate_idx, signal, min_distance_samples)
+    return time_ms[peak_idx]
+
+
+def choose_ppg_peak_times(time_ms: np.ndarray, values: np.ndarray, expected_count: int | None = None) -> np.ndarray:
+    positive = detect_peaks(time_ms, values, min_distance_s=0.35, threshold_scale=0.45, use_abs=False)
+    negative = detect_peaks(time_ms, -np.asarray(values, dtype=float), min_distance_s=0.35, threshold_scale=0.45, use_abs=False)
+
+    if expected_count and expected_count > 0:
+        return min((positive, negative), key=lambda peaks: abs(len(peaks) - expected_count))
+    return positive if len(positive) >= len(negative) else negative
+
+
+def valid_rr_intervals_ms(peak_times_ms: np.ndarray) -> np.ndarray:
+    peak_times_ms = np.asarray(peak_times_ms, dtype=float)
+    rr_ms = np.diff(peak_times_ms)
+    return rr_ms[np.isfinite(rr_ms) & (rr_ms >= 300.0) & (rr_ms <= 2000.0)]
+
+
+def compute_derived_metrics(rows: list[SyncRow], ecg_filtered: np.ndarray, ppg_filtered: np.ndarray) -> DerivedMetrics:
+    rows = normalize_sync_rows(rows)
+    metrics = DerivedMetrics()
+    if not rows:
+        return metrics
+
+    time_ms = np.array([row.time_ms for row in rows], dtype=float)
+    ecg_filtered = np.asarray(ecg_filtered, dtype=float)
+    ppg_filtered = np.asarray(ppg_filtered, dtype=float)
+
+    ecg_mask = np.isfinite(ecg_filtered)
+    if np.count_nonzero(ecg_mask) >= 5:
+        ecg_peak_times = detect_peaks(
+            time_ms[ecg_mask],
+            ecg_filtered[ecg_mask],
+            min_distance_s=0.28,
+            threshold_scale=2.8,
+            use_abs=True,
+        )
+    else:
+        ecg_peak_times = np.array([], dtype=float)
+    metrics.ecg_peak_count = int(len(ecg_peak_times))
+
+    ppg_mask = np.isfinite(ppg_filtered)
+    if np.count_nonzero(ppg_mask) >= 5:
+        ppg_peak_times = choose_ppg_peak_times(
+            time_ms[ppg_mask],
+            ppg_filtered[ppg_mask],
+            expected_count=len(ecg_peak_times) if len(ecg_peak_times) else None,
+        )
+    else:
+        ppg_peak_times = np.array([], dtype=float)
+    metrics.ppg_peak_count = int(len(ppg_peak_times))
+
+    rr_ms = valid_rr_intervals_ms(ecg_peak_times)
+    if len(rr_ms):
+        metrics.instant_bpm = 60000.0 / float(rr_ms[-1])
+        metrics.pulse_source = "ECG"
+    else:
+        ppg_rr_ms = valid_rr_intervals_ms(ppg_peak_times)
+        if len(ppg_rr_ms):
+            metrics.instant_bpm = 60000.0 / float(ppg_rr_ms[-1])
+            metrics.pulse_source = "PPG"
+
+    if len(rr_ms) >= 2:
+        metrics.sdnn_ms = float(np.std(rr_ms, ddof=1))
+        metrics.rmssd_ms = float(np.sqrt(np.mean(np.square(np.diff(rr_ms)))))
+
+    if len(ecg_peak_times) and len(ppg_peak_times):
+        ptt_values: list[float] = []
+        for ecg_time in ecg_peak_times:
+            start = np.searchsorted(ppg_peak_times, ecg_time + PTT_MIN_MS)
+            if start >= len(ppg_peak_times):
+                continue
+            ptt_ms = ppg_peak_times[start] - ecg_time
+            if PTT_MIN_MS <= ptt_ms <= PTT_MAX_MS:
+                ptt_values.append(float(ptt_ms))
+        if ptt_values:
+            metrics.ptt_ms = float(np.median(ptt_values))
+            metrics.ptt_pair_count = len(ptt_values)
+
+    ppg_raw_mask = np.array([
+        np.isfinite(row.ppg_red_raw) and np.isfinite(row.ppg_ir_raw)
+        for row in rows
+    ], dtype=bool)
+    if np.count_nonzero(ppg_raw_mask) >= 5:
+        ppg_time_ms = time_ms[ppg_raw_mask]
+        red_raw = np.array([row.ppg_red_raw for row, keep in zip(rows, ppg_raw_mask) if keep], dtype=float)
+        ir_raw = np.array([row.ppg_ir_raw for row, keep in zip(rows, ppg_raw_mask) if keep], dtype=float)
+
+        red_dc = float(np.nanmean(red_raw))
+        ir_dc = float(np.nanmean(ir_raw))
+        red_ac_rms = rms(ppg_ac_component(red_raw, ppg_time_ms))
+        ir_ac_rms = rms(ppg_ac_component(ir_raw, ppg_time_ms))
+
+        if red_dc > 0 and ir_dc > 0 and np.isfinite(red_ac_rms) and np.isfinite(ir_ac_rms) and ir_ac_rms > 0:
+            ratio = (red_ac_rms / red_dc) / (ir_ac_rms / ir_dc)
+            metrics.spo2_percent = float(np.clip(110.0 - 25.0 * ratio, 70.0, 100.0))
+        if ir_dc > 0 and np.isfinite(ir_ac_rms):
+            metrics.perfusion_index_percent = 100.0 * ir_ac_rms / ir_dc
+
+    return metrics
+
+
+def format_metric(value: float, unit: str = "", decimals: int = 1) -> str:
+    if not np.isfinite(value):
+        return "--"
+    return f"{value:.{decimals}f}{unit}"
 
 
 class SyncUARTMonitor:
@@ -302,6 +499,17 @@ class SyncUARTMonitor:
         self.duration_var = tk.StringVar(value="10")
         self.mode_var = tk.StringVar(value="BOTH")
         self.status_var = tk.StringVar(value="Ready")
+        self.metric_defs = [
+            ("instant_bpm", "BPM (nhip tim)", "bpm", 1),
+            ("sdnn_ms", "SDNN (do lech RR)", "ms", 1),
+            ("rmssd_ms", "RMSSD (bien thien RR)", "ms", 1),
+            ("ptt_ms", "PTT (ECG->PPG)", "ms", 0),
+            ("spo2_percent", "SpO2 (oxy mau)", "%", 1),
+            ("perfusion_index_percent", "PI (tuoi mau)", "%", 2),
+        ]
+        self.metric_vars = {key: tk.StringVar(value="--") for key, _, _, _ in self.metric_defs}
+        self.metric_source_var = tk.StringVar(value="Nguon BPM: --")
+        self.metric_count_var = tk.StringVar(value="ECG peaks: 0 | PPG peaks: 0 | PTT pairs: 0")
 
         self.configure_styles()
         self.build_ui()
@@ -324,6 +532,8 @@ class SyncUARTMonitor:
         self.style.configure("Status.TLabel", background=PANEL_ALT, foreground=TEXT, padding=(14, 8), font=("Segoe UI", 9))
         self.style.configure("Field.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
         self.style.configure("Section.TLabel", background=PANEL, foreground=TEXT, font=("Segoe UI Semibold", 10))
+        self.style.configure("MetricName.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
+        self.style.configure("MetricValue.TLabel", background=PANEL, foreground=TEXT, font=("Segoe UI Semibold", 12))
 
         self.style.configure(
             "TButton",
@@ -447,6 +657,20 @@ class SyncUARTMonitor:
 
         log_frame = ttk.Frame(body, style="Panel.TFrame", padding=8, width=260)
         body.add(log_frame, weight=1)
+
+        metrics_frame = ttk.Frame(log_frame, style="Panel.TFrame")
+        metrics_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(metrics_frame, text="Derived metrics", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+
+        metrics_grid = ttk.Frame(metrics_frame, style="Panel.TFrame")
+        metrics_grid.pack(fill="x")
+        metrics_grid.columnconfigure(1, weight=1)
+        for row, (key, label, _, _) in enumerate(self.metric_defs):
+            ttk.Label(metrics_grid, text=label, style="MetricName.TLabel").grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Label(metrics_grid, textvariable=self.metric_vars[key], style="MetricValue.TLabel").grid(row=row, column=1, sticky="e", pady=2)
+        ttk.Label(metrics_frame, textvariable=self.metric_source_var, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(metrics_frame, textvariable=self.metric_count_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+
         ttk.Label(log_frame, text="UART log", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
         self.log_text = tk.Text(
             log_frame,
@@ -494,6 +718,29 @@ class SyncUARTMonitor:
             self.log_text.see("end")
         self.root.after(0, append)
 
+    def reset_metrics_panel(self):
+        for key in self.metric_vars:
+            self.metric_vars[key].set("--")
+        self.metric_source_var.set("Nguon BPM: --")
+        self.metric_count_var.set("ECG peaks: 0 | PPG peaks: 0 | PTT pairs: 0")
+
+    def update_metrics_panel(self, metrics: DerivedMetrics):
+        values = {
+            "instant_bpm": metrics.instant_bpm,
+            "sdnn_ms": metrics.sdnn_ms,
+            "rmssd_ms": metrics.rmssd_ms,
+            "ptt_ms": metrics.ptt_ms,
+            "spo2_percent": metrics.spo2_percent,
+            "perfusion_index_percent": metrics.perfusion_index_percent,
+        }
+        for key, _, unit, decimals in self.metric_defs:
+            spacer = " " if unit in ("bpm", "ms") else ""
+            self.metric_vars[key].set(format_metric(values[key], f"{spacer}{unit}", decimals))
+        self.metric_source_var.set(f"Nguon BPM: {metrics.pulse_source}")
+        self.metric_count_var.set(
+            f"ECG peaks: {metrics.ecg_peak_count} | PPG peaks: {metrics.ppg_peak_count} | PTT pairs: {metrics.ptt_pair_count}"
+        )
+
     def start_measurement(self):
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Dang do", "Dang co phien do khac.")
@@ -510,6 +757,7 @@ class SyncUARTMonitor:
             return
 
         self.stop_event.clear()
+        self.reset_metrics_panel()
         self.progress["maximum"] = duration_s
         self.progress["value"] = 0
         self.worker = threading.Thread(target=self.measure_worker, args=(duration_s,), daemon=True)
@@ -696,6 +944,7 @@ class SyncUARTMonitor:
     def plot_rows(self, rows: list[SyncRow], title: str):
         rows = normalize_sync_rows(rows)
         ecg_filtered, ppg_filtered = self.compute_filtered(rows)
+        metrics = compute_derived_metrics(rows, ecg_filtered, ppg_filtered)
         t = np.array([row.time_ms / 1000.0 for row in rows], dtype=float)
         ecg = np.array([row.ecg_raw for row in rows], dtype=float)
         ppg = np.array([row.ppg_ir_raw for row in rows], dtype=float)
@@ -733,6 +982,7 @@ class SyncUARTMonitor:
         self.figure.suptitle(title, color=TEXT, fontsize=11)
         self.figure.tight_layout()
         self.canvas.draw_idle()
+        self.update_metrics_panel(metrics)
 
 
 def main():
