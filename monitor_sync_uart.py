@@ -20,7 +20,7 @@ except ImportError:
 
 import matplotlib
 matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 
@@ -418,9 +418,9 @@ def format_metric(value: float, unit: str = "", decimals: int = 1) -> str:
 class SyncUARTMonitor:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("ECG + PPG Sync UART Logger")
-        self.root.geometry("1240x780")
-        self.root.minsize(1040, 660)
+        self.root.title("ECG + PPG BOTH Sync Monitor")
+        self.root.geometry("1360x840")
+        self.root.minsize(1120, 720)
         self.root.configure(bg=BG)
 
         self.serial_obj = None
@@ -432,7 +432,7 @@ class SyncUARTMonitor:
         self.port_var = tk.StringVar()
         self.person_var = tk.StringVar(value="unknown")
         self.duration_var = tk.StringVar(value="10")
-        self.mode_var = tk.StringVar(value="ECG")
+        self.mode_var = tk.StringVar(value="BOTH")
         self.status_var = tk.StringVar(value="Ready")
         self.metric_defs = [
             ("instant_bpm", "BPM (nhip tim)", "bpm", 1),
@@ -535,63 +535,47 @@ class SyncUARTMonitor:
 
         title_group = ttk.Frame(top, style="Topbar.TFrame")
         title_group.grid(row=0, column=0, sticky="w")
-        ttk.Label(title_group, text="ECG + PPG Sync Monitor", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(title_group, text="UART logger, single-signal capture, 400 Hz bandpass preview", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
-
-        actions = ttk.Frame(top, style="Topbar.TFrame")
-        actions.grid(row=0, column=2, sticky="e")
-        ttk.Button(actions, text="Start", style="Accent.TButton", command=self.start_measurement).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Stop", style="Danger.TButton", command=self.stop_measurement).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Open CSV", command=self.open_csv_file).pack(side="left")
-
-        controls = ttk.Frame(shell, style="Panel.TFrame", padding=(12, 8))
-        controls.pack(fill="x", pady=(8, 6))
-        controls.columnconfigure(9, weight=1)
-
-        ttk.Label(controls, text="COM PORT", style="Field.TLabel").grid(row=0, column=0, sticky="w")
-        self.port_combo = ttk.Combobox(controls, textvariable=self.port_var, width=18, state="readonly")
-        self.port_combo.grid(row=1, column=0, padx=(0, 8), pady=(4, 0), sticky="ew")
-        ttk.Button(controls, text="Refresh", command=self.refresh_ports).grid(row=1, column=1, padx=(0, 18), pady=(4, 0), sticky="w")
-
-        ttk.Label(controls, text="NGUOI DO", style="Field.TLabel").grid(row=0, column=2, sticky="w")
-        ttk.Entry(controls, textvariable=self.person_var, width=18).grid(row=1, column=2, padx=(0, 18), pady=(4, 0), sticky="ew")
-
-        ttk.Label(controls, text="MODE", style="Field.TLabel").grid(row=0, column=3, sticky="w")
-        ttk.Combobox(controls, textvariable=self.mode_var, values=["ECG", "PPG"], width=9, state="readonly").grid(row=1, column=3, padx=(0, 18), pady=(4, 0), sticky="ew")
-
-        ttk.Label(controls, text="THOI GIAN (S)", style="Field.TLabel").grid(row=0, column=4, sticky="w")
-        ttk.Entry(controls, textvariable=self.duration_var, width=10).grid(row=1, column=4, padx=(0, 18), pady=(4, 0), sticky="ew")
-
-        ttk.Label(controls, text="TIEN TRINH", style="Field.TLabel").grid(row=0, column=5, sticky="w")
-        self.progress = ttk.Progressbar(controls, mode="determinate", length=220)
-        self.progress.grid(row=1, column=5, columnspan=5, pady=(4, 0), sticky="ew")
-
-        ttk.Label(shell, textvariable=self.status_var, style="Status.TLabel").pack(fill="x", pady=(0, 8))
+        ttk.Label(title_group, text="ECG + PPG BOTH Sync Monitor", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title_group, text="UART logger, synchronized 400 Hz capture, four-panel bandpass preview", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
 
         body = ttk.PanedWindow(shell, orient="horizontal")
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, pady=(8, 0))
 
-        plot_frame = ttk.Frame(body, style="Panel.TFrame", padding=8)
-        body.add(plot_frame, weight=6)
+        log_frame = ttk.Frame(body, style="Panel.TFrame", padding=10, width=340)
+        body.add(log_frame, weight=2)
 
-        self.figure = Figure(figsize=(8.4, 5.2), dpi=100, facecolor=PLOT_BG)
-        self.ax_raw = self.figure.add_subplot(211)
-        self.ax_filtered = self.figure.add_subplot(212, sharex=self.ax_raw)
-        self.style_axes()
-        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
-        canvas_widget = self.canvas.get_tk_widget()
-        canvas_widget.configure(bg=PLOT_BG, highlightthickness=0)
-        canvas_widget.pack(fill="both", expand=True)
-        toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
-        toolbar.configure(bg=PANEL)
-        for child in toolbar.winfo_children():
-            try:
-                child.configure(bg=PANEL)
-            except tk.TclError:
-                pass
+        controls_frame = ttk.Frame(log_frame, style="Panel.TFrame")
+        controls_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(controls_frame, text="Capture controls", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
 
-        log_frame = ttk.Frame(body, style="Panel.TFrame", padding=8, width=260)
-        body.add(log_frame, weight=1)
+        ttk.Label(controls_frame, text="COM PORT", style="Field.TLabel").pack(anchor="w")
+        port_row = ttk.Frame(controls_frame, style="Panel.TFrame")
+        port_row.pack(fill="x", pady=(4, 8))
+        self.port_combo = ttk.Combobox(port_row, textvariable=self.port_var, width=18, state="readonly")
+        self.port_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(port_row, text="Refresh", command=self.refresh_ports).pack(side="left")
+
+        ttk.Label(controls_frame, text="NGUOI DO", style="Field.TLabel").pack(anchor="w")
+        ttk.Entry(controls_frame, textvariable=self.person_var).pack(fill="x", pady=(4, 8))
+
+        mode_duration = ttk.Frame(controls_frame, style="Panel.TFrame")
+        mode_duration.pack(fill="x", pady=(0, 8))
+        mode_duration.columnconfigure(1, weight=1)
+        ttk.Label(mode_duration, text="MODE", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(mode_duration, text="THOI GIAN (S)", style="Field.TLabel").grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(mode_duration, text="BOTH", style="Section.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(mode_duration, textvariable=self.duration_var, width=10).grid(row=1, column=1, sticky="ew", padx=(16, 0), pady=(4, 0))
+
+        actions = ttk.Frame(controls_frame, style="Panel.TFrame")
+        actions.pack(fill="x", pady=(2, 8))
+        ttk.Button(actions, text="Start", style="Accent.TButton", command=self.start_measurement).pack(fill="x", pady=(0, 6))
+        ttk.Button(actions, text="Stop", style="Danger.TButton", command=self.stop_measurement).pack(fill="x", pady=(0, 6))
+        ttk.Button(actions, text="Open CSV", command=self.open_csv_file).pack(fill="x")
+
+        ttk.Label(controls_frame, text="TIEN TRINH", style="Field.TLabel").pack(anchor="w")
+        self.progress = ttk.Progressbar(controls_frame, mode="determinate", length=220)
+        self.progress.pack(fill="x", pady=(4, 8))
+        ttk.Label(controls_frame, textvariable=self.status_var, style="Status.TLabel").pack(fill="x")
 
         metrics_frame = ttk.Frame(log_frame, style="Panel.TFrame")
         metrics_frame.pack(fill="x", pady=(0, 12))
@@ -627,8 +611,23 @@ class SyncUARTMonitor:
         )
         self.log_text.pack(fill="both", expand=True)
 
+        plot_frame = ttk.Frame(body, style="Panel.TFrame", padding=2)
+        body.add(plot_frame, weight=7)
+
+        self.figure = Figure(figsize=(9.2, 7.0), dpi=100, facecolor=PLOT_BG)
+        self.ax_ecg_raw = self.figure.add_subplot(411)
+        self.ax_ecg_filtered = self.figure.add_subplot(412, sharex=self.ax_ecg_raw)
+        self.ax_ppg_raw = self.figure.add_subplot(413, sharex=self.ax_ecg_raw)
+        self.ax_ppg_filtered = self.figure.add_subplot(414, sharex=self.ax_ecg_raw)
+        self.style_axes()
+        self.figure.subplots_adjust(left=0.095, right=0.995, top=0.985, bottom=0.055, hspace=0.42)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.configure(bg=PLOT_BG, highlightthickness=0)
+        canvas_widget.pack(fill="both", expand=True)
+
     def style_axes(self):
-        for ax in (self.ax_raw, self.ax_filtered):
+        for ax in (self.ax_ecg_raw, self.ax_ecg_filtered, self.ax_ppg_raw, self.ax_ppg_filtered):
             ax.set_facecolor(PLOT_BG)
             ax.tick_params(colors=MUTED, labelsize=9, pad=4)
             ax.xaxis.label.set_color(TEXT)
@@ -742,7 +741,7 @@ class SyncUARTMonitor:
             self.set_status(f"ERROR: {exc}")
 
     def measure_worker(self, duration_s: int):
-        mode = self.mode_var.get().upper()
+        mode = "BOTH"
         person = self.person_var.get().strip() or "unknown"
         port = self.port_var.get()
 
@@ -753,7 +752,7 @@ class SyncUARTMonitor:
                 time.sleep(0.3)
                 ser.reset_input_buffer()
 
-                board_mode = "ECG" if mode == "ECG" else "PPG"
+                board_mode = "BOTH"
                 ser.write((board_mode + "\n").encode("utf-8"))
                 time.sleep(0.1)
                 ser.write((f"START {duration_s}\n").encode("utf-8"))
@@ -894,44 +893,34 @@ class SyncUARTMonitor:
         ppg = np.array([row.ppg_ir_raw for row in rows], dtype=float)
         ecg_mask = np.isfinite(ecg)
         ppg_mask = np.isfinite(ppg)
-        mode = self.mode_var.get().upper()
-        show_ppg = mode == "PPG" and ppg_mask.any()
-        if mode == "ECG" and not ecg_mask.any() and ppg_mask.any():
-            show_ppg = True
-        if mode == "PPG" and not ppg_mask.any() and ecg_mask.any():
-            show_ppg = False
 
-        for ax in (self.ax_raw, self.ax_filtered):
+        for ax in (self.ax_ecg_raw, self.ax_ecg_filtered, self.ax_ppg_raw, self.ax_ppg_filtered):
             ax.clear()
         self.style_axes()
 
-        if show_ppg:
-            self.ax_raw.plot(t[ppg_mask], ppg[ppg_mask], color="#000000", linewidth=0.95, label="PPG IR raw")
-            self.ax_filtered.plot(t[ppg_mask], ppg_filtered[ppg_mask], color="#dc2626", linewidth=1.2, label="PPG IR bandpass")
-            raw_ylabel = "PPG IR raw count"
-            filtered_ylabel = "PPG IR bandpass count"
-        elif ecg_mask.any():
-            self.ax_raw.plot(t[ecg_mask], ecg[ecg_mask], color="#000000", linewidth=0.95, label="ECG raw")
-            self.ax_filtered.plot(t[ecg_mask], ecg_filtered[ecg_mask], color="#dc2626", linewidth=1.2, label="ECG bandpass")
-            raw_ylabel = "ECG raw count"
-            filtered_ylabel = "ECG bandpass count"
-        else:
-            raw_ylabel = "Raw count"
-            filtered_ylabel = "Bandpass count"
+        if ecg_mask.any():
+            self.ax_ecg_raw.plot(t[ecg_mask], ecg[ecg_mask], color="#000000", linewidth=0.9, label="ECG raw")
+            self.ax_ecg_filtered.plot(t[ecg_mask], ecg_filtered[ecg_mask], color="#dc2626", linewidth=1.15, label="ECG bandpass")
+        if ppg_mask.any():
+            self.ax_ppg_raw.plot(t[ppg_mask], ppg[ppg_mask], color="#000000", linewidth=0.9, label="PPG IR raw")
+            self.ax_ppg_filtered.plot(t[ppg_mask], ppg_filtered[ppg_mask], color="#dc2626", linewidth=1.15, label="PPG IR bandpass")
 
-        self.ax_raw.set_title("Raw signal", loc="center", color=TEXT, fontsize=11, fontweight="semibold", pad=10)
-        self.ax_raw.set_ylabel(raw_ylabel)
-        self.ax_filtered.set_title("Bandpass filtered signal", loc="center", color=TEXT, fontsize=11, fontweight="semibold", pad=10)
-        self.ax_filtered.set_xlabel("Time (s)")
-        self.ax_filtered.set_ylabel(filtered_ylabel)
+        self.ax_ecg_raw.set_title("ECG raw", loc="center", color=TEXT, fontsize=11, fontweight="semibold", pad=6)
+        self.ax_ecg_raw.set_ylabel("ADC count")
+        self.ax_ecg_filtered.set_title("ECG bandpass", loc="center", color=TEXT, fontsize=11, fontweight="semibold", pad=6)
+        self.ax_ecg_filtered.set_ylabel("Count")
+        self.ax_ppg_raw.set_title("PPG IR raw", loc="center", color=TEXT, fontsize=11, fontweight="semibold", pad=6)
+        self.ax_ppg_raw.set_ylabel("Optical count")
+        self.ax_ppg_filtered.set_title("PPG IR bandpass", loc="center", color=TEXT, fontsize=11, fontweight="semibold", pad=6)
+        self.ax_ppg_filtered.set_xlabel("Time (s)")
+        self.ax_ppg_filtered.set_ylabel("Count")
 
-        for ax in (self.ax_raw, self.ax_filtered):
+        for ax in (self.ax_ecg_raw, self.ax_ecg_filtered, self.ax_ppg_raw, self.ax_ppg_filtered):
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 ax.legend(handles, labels, loc="upper right", facecolor=PANEL, edgecolor=BORDER, labelcolor=TEXT)
 
-        self.figure.suptitle(title, color=TEXT, fontsize=11)
-        self.figure.subplots_adjust(left=0.12, right=0.985, top=0.92, bottom=0.09, hspace=0.45)
+        self.figure.subplots_adjust(left=0.095, right=0.995, top=0.985, bottom=0.055, hspace=0.42)
         self.canvas.draw_idle()
         self.update_metrics_panel(metrics)
 

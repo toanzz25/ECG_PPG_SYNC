@@ -32,12 +32,12 @@ typedef enum {
 } sensor_mode_t;
 
 typedef struct {
-  uint32_t time_ms;
+  uint32_t time_us;
   uint16_t ecg_raw;
 } ecg_sample_t;
 
 typedef struct {
-  uint32_t time_ms;
+  uint32_t time_us;
   uint32_t red_raw;
   uint32_t ir_raw;
 } ppg_sample_t;
@@ -49,9 +49,9 @@ typedef struct {
 #define I2C_FREQ_HZ   400000
 
 #define powerLed      UINT8_C(0x1F)
-#define sampleAverage 4
+#define sampleAverage 1
 #define ledMode       2
-#define sampleRate    100
+#define sampleRate    400
 #define pulseWidth    411
 #define adcRange      16384
 
@@ -59,7 +59,7 @@ typedef struct {
 #define ADC_CHANNEL   ADC_CHANNEL_6 // GPIO34
 #define ADC_UNIT      ADC_UNIT_1
 #define ADC_ATTEN     ADC_ATTEN_DB_12
-#define ADC_SAMPLE_RATE 1000
+#define ADC_SAMPLE_RATE 400
 #define ECG_ADC_OVERSAMPLE_COUNT 4
 #define ECG_CLIP_LOW_THRESHOLD 20
 #define ECG_CLIP_HIGH_THRESHOLD 4075

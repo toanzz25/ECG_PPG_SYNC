@@ -4,8 +4,8 @@
  * Luong dung:
  * - PC gui mode: ECG / PPG / BOTH.
  * - PC gui START <duration_s>.
- * - ESP32 reset timestamp, cap phat buffer, bat esp_timer 1 kHz cho ECG.
- * - PPG duoc doc tu FIFO MAX30102 va gan timestamp nguoc theo sample rate.
+ * - ESP32 reset timestamp, cap phat buffer, bat esp_timer 400 Hz cho ECG.
+ * - PPG duoc doc tu FIFO MAX30102 va gan timestamp theo sample index 400 Hz.
  * - Trong luc do khong stream mau realtime.
  * - Het thoi gian do moi gui toan bo du lieu tho CSV qua UART.
  */
@@ -51,6 +51,7 @@ static bool ppg_ready = false;
 static volatile int64_t measurement_start_us = 0;
 static volatile uint32_t measurement_duration_ms = 0;
 static uint32_t ecg_sample_index = 0;
+static uint32_t ppg_sample_index = 0;
 static uint32_t ecg_first_actual_us = 0;
 static uint32_t ecg_last_actual_us = 0;
 static uint32_t ecg_min_period_us = UINT_MAX;
@@ -153,6 +154,7 @@ static void reset_measurement_state(void)
   ecg_count = 0;
   ppg_count = 0;
   ecg_sample_index = 0;
+  ppg_sample_index = 0;
   ecg_first_actual_us = 0;
   ecg_last_actual_us = 0;
   ecg_min_period_us = UINT_MAX;
@@ -163,9 +165,9 @@ static void reset_measurement_state(void)
   ppg_overflow = false;
 }
 
-static bool measurement_time_in_range(uint32_t time_ms)
+static bool measurement_time_us_in_range(uint32_t time_us)
 {
-  return time_ms < measurement_duration_ms;
+  return time_us < (measurement_duration_ms * 1000U);
 }
 
 void ad8232_configure(void)
@@ -356,12 +358,6 @@ esp_err_t sensor_start_measurement(sensor_mode_t mode, uint32_t duration_s)
   portEXIT_CRITICAL(&data_lock);
 
   if(mode_has_ecg(mode)){
-    int first_raw = read_ecg_raw();
-    if(first_raw >= 0){
-      uint32_t actual_us = 0;
-      (void)measurement_elapsed_us(&actual_us);
-      store_ecg_sample((uint16_t)first_raw, actual_us);
-    }
     ESP_GOTO_ON_ERROR(esp_timer_start_periodic(ecg_timer_handle, ECG_TIMER_PERIOD_US),
                       fail_after_start, TAG_ADC, "start ECG timer failed");
   }
@@ -425,18 +421,10 @@ static void store_ecg_sample(uint16_t raw, uint32_t actual_us)
     return;
   }
 
-  uint32_t time_ms = actual_us / 1000U;
+  uint32_t time_us = ecg_sample_index * ECG_TIMER_PERIOD_US;
   ecg_sample_index++;
 
-  if(ecg_count > 0 && ecg_buffer != NULL){
-    uint32_t previous_time_ms = ecg_buffer[ecg_count - 1].time_ms;
-    if(time_ms <= previous_time_ms){
-      time_ms = previous_time_ms + 1U;
-      actual_us = time_ms * 1000U;
-    }
-  }
-
-  if(measurement_time_in_range(time_ms) && ecg_buffer != NULL && ecg_count < ecg_capacity){
+  if(measurement_time_us_in_range(time_us) && ecg_buffer != NULL && ecg_count < ecg_capacity){
     if(ecg_count == 0){
       ecg_first_actual_us = actual_us;
     }
@@ -456,11 +444,11 @@ static void store_ecg_sample(uint16_t raw, uint32_t actual_us)
     if(raw >= ECG_CLIP_HIGH_THRESHOLD){
       ecg_clip_high_count++;
     }
-    ecg_buffer[ecg_count].time_ms = time_ms;
+    ecg_buffer[ecg_count].time_us = time_us;
     ecg_buffer[ecg_count].ecg_raw = raw;
     ecg_count++;
   }
-  else if(measurement_time_in_range(time_ms)){
+  else if(measurement_time_us_in_range(time_us)){
     ecg_overflow = true;
   }
   portEXIT_CRITICAL(&data_lock);
@@ -503,7 +491,7 @@ static void ecg_timer_callback(void *arg)
   }
 }
 
-static void store_ppg_sample(uint32_t time_ms, uint32_t red, uint32_t ir)
+static void store_ppg_sample(uint32_t time_us, uint32_t red, uint32_t ir)
 {
   portENTER_CRITICAL(&data_lock);
   if(!measurement_running || !mode_has_ppg(active_mode)){
@@ -511,13 +499,13 @@ static void store_ppg_sample(uint32_t time_ms, uint32_t red, uint32_t ir)
     return;
   }
 
-  if(measurement_time_in_range(time_ms) && ppg_buffer != NULL && ppg_count < ppg_capacity){
-    ppg_buffer[ppg_count].time_ms = time_ms;
+  if(measurement_time_us_in_range(time_us) && ppg_buffer != NULL && ppg_count < ppg_capacity){
+    ppg_buffer[ppg_count].time_us = time_us;
     ppg_buffer[ppg_count].red_raw = red;
     ppg_buffer[ppg_count].ir_raw = ir;
     ppg_count++;
   }
-  else if(measurement_time_in_range(time_ms)){
+  else if(measurement_time_us_in_range(time_us)){
     ppg_overflow = true;
   }
   portEXIT_CRITICAL(&data_lock);
@@ -554,29 +542,29 @@ static void dump_measurement_csv(void)
   portEXIT_CRITICAL(&data_lock);
 
   printf("BEGIN_SYNC_CSV,%u,%u\n", (unsigned)local_ecg_count, (unsigned)local_ppg_count);
-  printf("time_ms,ecg_raw,ppg_red_raw,ppg_ir_raw\n");
+  printf("time_us,ecg_raw,ppg_red_raw,ppg_ir_raw\n");
 
   size_t i = 0;
   size_t j = 0;
   while(i < local_ecg_count || j < local_ppg_count){
-    if(i < local_ecg_count && j < local_ppg_count && ecg_buffer[i].time_ms == ppg_buffer[j].time_ms){
+    if(i < local_ecg_count && j < local_ppg_count && ecg_buffer[i].time_us == ppg_buffer[j].time_us){
       printf("%lu,%u,%lu,%lu\n",
-             (unsigned long)ecg_buffer[i].time_ms,
+             (unsigned long)ecg_buffer[i].time_us,
              (unsigned)ecg_buffer[i].ecg_raw,
              (unsigned long)ppg_buffer[j].red_raw,
              (unsigned long)ppg_buffer[j].ir_raw);
       i++;
       j++;
     }
-    else if(j >= local_ppg_count || (i < local_ecg_count && ecg_buffer[i].time_ms < ppg_buffer[j].time_ms)){
+    else if(j >= local_ppg_count || (i < local_ecg_count && ecg_buffer[i].time_us < ppg_buffer[j].time_us)){
       printf("%lu,%u,,\n",
-             (unsigned long)ecg_buffer[i].time_ms,
+             (unsigned long)ecg_buffer[i].time_us,
              (unsigned)ecg_buffer[i].ecg_raw);
       i++;
     }
     else{
       printf("%lu,,%lu,%lu\n",
-             (unsigned long)ppg_buffer[j].time_ms,
+             (unsigned long)ppg_buffer[j].time_us,
              (unsigned long)ppg_buffer[j].red_raw,
              (unsigned long)ppg_buffer[j].ir_raw);
       j++;
@@ -626,16 +614,15 @@ void readMAX30102_task(void *pvParameter)
     }
 
     uint16_t sample_count = 0;
-    uint32_t batch_time_ms = measurement_time_ms();
     if(max30105_check(&ppg_sensor, &sample_count) == ESP_OK && sample_count > 0){
       uint8_t available = max30105_available(&ppg_sensor);
 
       for(uint8_t i = 0; i < available; i++){
-        uint32_t age_ms = (((uint32_t)available - 1U - i) * PPG_SAMPLE_PERIOD_US) / 1000U;
-        uint32_t time_ms = (batch_time_ms > age_ms) ? (batch_time_ms - age_ms) : 0;
+        uint32_t time_us = ppg_sample_index * PPG_SAMPLE_PERIOD_US;
         uint32_t red = max30105_get_fifo_red(&ppg_sensor);
         uint32_t ir = max30105_get_fifo_ir(&ppg_sensor);
-        store_ppg_sample(time_ms, red, ir);
+        ppg_sample_index++;
+        store_ppg_sample(time_us, red, ir);
         max30105_next_sample(&ppg_sensor);
       }
     }
@@ -646,7 +633,7 @@ void readMAX30102_task(void *pvParameter)
 
 void readAD8232_task(void *pvParameter)
 {
-  ESP_LOGI(TAG_ADC, "AD8232 ECG sampled by esp_timer");
+  ESP_LOGI(TAG_ADC, "AD8232 ECG sampled by esp_timer 400 Hz");
   while(true){
     vTaskDelay(delay_ticks_at_least_1(1000));
   }
@@ -674,5 +661,5 @@ void printData_task(void *pvParameter)
 
 void sensor_timer_callback(void)
 {
-  /* ECG da duoc lay mau boi esp_timer 1 kHz trong file nay. */
+  /* ECG da duoc lay mau boi esp_timer 400 Hz trong file nay. */
 }
